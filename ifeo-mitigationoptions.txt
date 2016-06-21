@@ -1,0 +1,252 @@
+                        ------------------------
+                        IFEO - MitigationOptions
+                        ------------------------
+
+Overview
+--------
+
+As far as I know the MitigationOptions (QWORD) registry entry from Window's
+Image File Executable Options (IFEO) key isn't completely documented.  The
+general gist of how it works is you create a key in IFEO which is the name of
+the executable whose options you want to change.  This is explained in the
+force ASLR Windows update KB article[1].
+
+That is, you create a new key in:
+HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options
+
+Using the executable name as its name (e.g. foo.exe).  You can then add various
+entries under this key to change certain behaviors such as the various
+mitigation technologies in Windows.  This document is about the
+MitigationOptions QWORD entry.
+
+
+Structure
+---------
+
+MitigationOptions is just a bitmask which can control the various mitigation
+technologies in Windows.  The structure is very similar to the
+PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY attribute from the
+UpdateProcThreadAttribute function[2].  It follows the order and bitmask values
+nearly identically.
+
+Take the following example from an executable that's been added to EMET:
+
+    0x2000000010111
+
+This setup enables DEP, SEHOP, force ASLR and bottom up ASLR.  Furthermore it
+disables Win10's system font restriction (although this also happens to default
+to disabled as a system wide policy).
+
+
+Breakdown
+---------
+
+For a complete breakdown we'll use the following hex value for
+MitigationOptions:
+
+    0x112010101111111
+
+This is just about as much as can be reasonable enabled for most applications
+without breaking them.  Some options will be redundant as they would've already
+been enabled (such as DEP for 64-bit processes) or ignored completely (HEASLR
+for 32-bit processes).
+
+I'm just going to go one by one through the options from right to left
+(increasing the << value essentially).  A value of 0 generally means it will
+defer to the application/other ways of setting these.  It's essentially a
+no-op so these can still be changed using the thread attributes, etc.  Certain
+options can be enabled/disabled at will.  Some will be permanently enabled once
+enabled for the first time.
+
+These options were tested using Windows 10 TH2.  Certain options are not
+available on older versions.  I've marked where roughly the boundaries are on
+what should work for which Windows version.
+
+    For all options:
+        0 = Defer/Do Nothing
+
+Windows 7+:
+0x112010101111111
+                ^
+    This controls DEP (data execution prevention).
+        1 = Always On
+        2 = Always On but enable ATL thunk emulation
+
+0x112010101111111
+               ^
+    SEHOP[3].  For 32-bit processes only, ignored for 64-bit.
+        1 = Enabled SEHOP
+    Also controlled with the IFEO DisableExceptionChainValidation DWORD.
+        DisableExceptionChainValidation with a value of 0 ENABLES SEHOP
+
+0x112010101111111
+              ^
+    Force ASLR[1], introduced in Windows 7.
+        1 = Enable force relocate.  Modules that do not contain a reloc section
+            will still load.
+        2 = Force relocate off.  I'm not sure why'd you want to use this.
+        3 = Force relocate always on.  Modules that do not contain a reloc
+            section will NOT load.
+    Unlike setting this programmatically, this will work on the executable
+    itself if it has a relocation section but otherwise did not have
+    /DYNAMICBASE set.
+
+0x112010101111111
+             ^
+    Heap terminate.
+        1 = Always On
+        2 = Always Off (sort of, if not otherwise already enabled)
+    Depending on the Windows version targeted in Visual Studio and/or the
+    value of the subsystem image header this may already be enabled.
+
+0x112010101111111
+            ^
+    Bottom-Up ASLR.  Includes stuff such as stack randomization.
+        1 = Always On
+        2 = Always Off
+
+Windows 8+:
+0x112010101111111
+           ^
+    HEASLR - High Entropy bottom-up ASLR (64-bit only).
+        1 = Always On
+        2 = Always Off
+    Ignored for 32-bit processes.  Requires bottom-up randomization.
+
+0x112010101111111
+          ^
+    Strict handle checks.
+        1 = Always On
+        2 = Always Off
+    Causes an immediate exception on a bad handle reference.  Essentially a
+    fail and crash now option instead of returning a failure status to the
+    handle reference.
+
+0x112010101111111
+         ^
+    Win32k system call disable policy.
+        1 = Always On
+        2 = Always Off
+    One of the few options that can't be enabled here and for nearly all
+    applications will cause a crash when ran.  This basically has to be
+    enabled by the running process itself.  Chrome uses it for its renderer
+    processes and is adding support for plugin processes (Flash, pdf and
+    widevine should all be feature complete as of writing on the dev branch).
+
+0x112010101111111
+        ^
+    Extension point disable policy.  Disables legacy extension points.
+        1 = Always On
+        2 = Always Off
+    Will disable:
+        - AppInit DLLs
+        - Winsock Layered Service Providers (LSPs)
+        - Globoal Windows Hooks
+        - Legacy Input Method Editors (IMEs)
+    Local hooks still work.
+
+Windows 10+:
+0x112010101111111
+       ^
+    Dynamic code policy (probably).  Prevents a process from generating dynamic
+    code or modifying executable code.
+        0 = Defer
+        1 = Always On
+        2 = Always Off
+        3 = Always On but allow opt-out.
+    Not sure if this is useful yet.
+
+0x112010101111111
+      ^
+    Control Flow Guard (CFG).
+        1 = Enable
+        2 = Disable(?)
+    This just enables support for the given executable.  If it lacks CFG
+    instrumentation then this isn't going to fix that.  HOWEVER it may be
+    useful for allowing modules compiled with CF instrumentation to actually
+    use it.  Currently if the executable isn't linked with CFG support any
+    loaded modules even if they have CFG support won't use it, perhaps this can
+    enable its use (untested).
+
+0x112010101111111
+     ^
+    Binary signature policy.
+        1 = Microsoft signed only.
+        2 = ?? (disable? not sure)
+        ? = ?? The other options[4] don't appear to be available.
+
+0x112010101111111
+    ^
+    Font loading prevention.  When enabled applications can't load non-system
+    fonts (i.e. System32/Fonts).
+        0 = Defer
+        1 = Always On
+        2 = Always Off
+        3 = On but audit instead of hard failing
+    Funny thing about this option, if you use EMET and use the default Chrome
+    profile it will actually wind up disabling Chrome's use of this feature
+    because it sets it to always off.  So if you use EMET with Chrome you may
+    want to change this to 0 in the registry so some of Chrome's processes can
+    use it (e.g. renderer, plugin, gpu).
+
+Windows 10 TH2+:
+0x112010101111111
+   ^
+    Image load policy (remote images).
+        0 = Defer
+        1 = Always On
+        2 = Always Off
+        3 = Reserved(?)
+    Blocks loading of remote images.
+
+0x112010101111111
+  ^
+    Image load policy (low mandatory label).
+        0 = Defer
+        1 = Always On
+        2 = Always Off
+        3 = Reserved(?)
+    Blocks loading of images with the low mandatory label (e.g. temp internet
+    files).
+
+The prefer system32 image load policy does not seem to be accessible through
+MitigationOptions (or at least I didn't seem to find it).
+
+You can use Process Hacker to view some of the enabled mitigations by right
+clicking a running process -> Properties -> under the General tab click
+"details" on the Mitigation policies line.  Clicking on the mitigations can
+show additional information such as HEASLR being used under the ASLR entry.
+
+
+Thoughts/Other
+--------------
+
+You can use Process Hacker to view some of the enabled mitigations by right
+clicking a running process -> Properties -> under the General tab click
+"details" on the Mitigation policies line.  Clicking on the mitigations can
+show additional information such as HEASLR being used under the ASLR entry.
+
+I'm not sure why these features are more well documented or otherwise exposed.
+EMET only exposes a handful of them and it took them until the latest few
+versions to actually get around to using this registry entry.  I can understand
+it's probably out of concern for compatibility and possibly unknown side effects
+but they still seem like a useful way to gain protection from mitigations for
+images that weren't compiled with them built-in (do developers even know about
+half of these options?).
+
+The MitigationOptions IFEO registry entry kind of seems like a useful feature
+that you would want to better document.
+
+
+Disclaimer:
+Using any of these may cause dragons to appear or otherwise break something.
+Use at your own risk.
+
+Changelog:
+2016/06/21 - Initial version.
+
+Sources:
+[1] https://support.microsoft.com/en-us/kb/2639308
+[2] https://msdn.microsoft.com/en-us/library/windows/desktop/ms686880%28v=vs.85%29.aspx
+[3] https://blogs.technet.microsoft.com/srd/2009/02/02/preventing-the-exploitation-of-structured-exception-handler-seh-overwrites-with-sehop/
+[4] https://msdn.microsoft.com/en-us/library/windows/desktop/mt706242(v=vs.85).aspx
